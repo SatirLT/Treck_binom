@@ -1,8 +1,14 @@
 import Foundation
 import UIKit
+import CommonCrypto
 
-/// Main tracker class for Binom iOS install tracking.
-/// Handles install attribution, event tracking, and postback communication.
+/// Трекер установок iOS-приложений с интеграцией в Binom.
+///
+/// Принцип работы:
+/// 1. При первом запуске генерирует хэш устройства (тот же алгоритм, что на лендинге)
+/// 2. Отправляет хэш + данные устройства на сервер
+/// 3. Сервер сравнивает хэш с сохранённым хэшем от лендинга
+/// 4. Если совпадает — установка привязывается к клику → постбек в Binom
 public final class BinomTracker {
 
     public static let shared = BinomTracker()
@@ -20,10 +26,10 @@ public final class BinomTracker {
 
     private init() {}
 
-    /// Configure the tracker. Call this in application(_:didFinishLaunchingWithOptions:).
+    /// Настроить трекер. Вызывать в application(_:didFinishLaunchingWithOptions:).
     /// - Parameters:
-    ///   - serverURL: Your tracking server URL (e.g., "https://your-server.com")
-    ///   - debug: Enable debug logging
+    ///   - serverURL: URL вашего сервера трекинга (например, "https://your-server.com")
+    ///   - debug: Включить отладочные логи
     public func configure(serverURL: String, debug: Bool = false) {
         self.serverURL = serverURL.hasSuffix("/") ? String(serverURL.dropLast()) : serverURL
         self.bundleId = Bundle.main.bundleIdentifier ?? ""
@@ -33,10 +39,50 @@ public final class BinomTracker {
         log("BinomTracker configured: \(self.serverURL)")
     }
 
+    // MARK: - Client Hash Generation
+
+    /// Генерирует клиентский хэш устройства.
+    ///
+    /// ВАЖНО: Этот же алгоритм используется в landing/tracker.js.
+    /// Формат строки: "screenW|screenH|lang|timezone"
+    ///
+    /// Примеры:
+    ///   iPhone 15 Pro: "1179|2556|ru|Europe/Moscow"
+    ///   iPhone 14:     "1170|2532|en|America/New_York"
+    private func generateClientHash() -> String {
+        let screen = UIScreen.main
+        // Реальные пиксели экрана (bounds * scale) — как screen.width * devicePixelRatio в JS
+        let screenW = Int(screen.bounds.width * screen.scale)
+        let screenH = Int(screen.bounds.height * screen.scale)
+
+        // Язык — только код языка (2 символа), как lang.split('-')[0] в JS
+        let lang = (Locale.current.languageCode ?? "en").lowercased()
+
+        // Часовой пояс — идентичен в Safari и iOS
+        let timezone = TimeZone.current.identifier
+
+        let raw = "\(screenW)|\(screenH)|\(lang)|\(timezone)"
+        log("Hash input: \(raw)")
+
+        let hash = sha256(raw)
+        // Первые 32 символа (128 бит) — как в JS
+        return String(hash.prefix(32))
+    }
+
+    /// SHA-256 хэш строки → hex-строка.
+    private func sha256(_ string: String) -> String {
+        let data = Data(string.utf8)
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes {
+            _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
     // MARK: - Install Tracking
 
-    /// Track app install. Call this after configure() in didFinishLaunchingWithOptions.
-    /// Only sends the install postback once (first launch after install).
+    /// Трекинг установки. Вызывать после configure() при запуске приложения.
+    /// Отправляет постбек только один раз (при первом запуске после установки).
     public func trackInstall(completion: ((Bool) -> Void)? = nil) {
         guard isConfigured else {
             log("Error: BinomTracker not configured. Call configure() first.")
@@ -44,27 +90,32 @@ public final class BinomTracker {
             return
         }
 
-        // Check if already tracked
+        // Проверяем, не трекали ли уже
         if UserDefaults.standard.bool(forKey: installKey) {
             log("Install already tracked, skipping")
             completion?(true)
             return
         }
 
-        // Collect device data
-        let deviceData = collectDeviceData()
+        // Собираем данные устройства
+        var params = collectDeviceData()
 
-        // Try to retrieve click_id from clipboard
+        // Генерируем клиентский хэш (тот же алгоритм, что на лендинге)
+        let clientHash = generateClientHash()
+        params["client_hash"] = clientHash
+        log("Client hash: \(clientHash)")
+
+        // Пытаемся достать click_id из буфера обмена
         retrieveClickId { [weak self] clickId in
             guard let self = self else { return }
 
-            var params = deviceData
             if let clickId = clickId {
                 params["click_id"] = clickId
                 self.saveClickId(clickId)
+                self.log("Click ID from clipboard: \(clickId)")
             }
 
-            // Send install data to server
+            // Отправляем на сервер
             self.sendRequest(endpoint: "/install", params: params) { success in
                 if success {
                     UserDefaults.standard.set(true, forKey: self.installKey)
@@ -77,11 +128,11 @@ public final class BinomTracker {
 
     // MARK: - Event Tracking
 
-    /// Track an in-app event (registration, purchase, etc.).
+    /// Трекинг in-app события (регистрация, покупка и т.д.).
     /// - Parameters:
-    ///   - name: Event name (e.g., "registration", "purchase", "level_complete")
-    ///   - value: Optional event value
-    ///   - payout: Optional payout value for revenue events
+    ///   - name: Имя события (например, "registration", "purchase")
+    ///   - value: Опциональное значение события
+    ///   - payout: Опциональная сумма (для revenue-событий)
     public func trackEvent(name: String, value: String? = nil, payout: Double? = nil, completion: ((Bool) -> Void)? = nil) {
         guard isConfigured else {
             log("Error: BinomTracker not configured")
@@ -123,7 +174,7 @@ public final class BinomTracker {
             "device_model": getDeviceModel(),
             "screen_width": String(Int(screen.bounds.width * screen.scale)),
             "screen_height": String(Int(screen.bounds.height * screen.scale)),
-            "language": Locale.current.languageCode ?? "",
+            "language": (Locale.current.languageCode ?? "en").lowercased(),
             "timezone": TimeZone.current.identifier,
         ]
     }
@@ -151,7 +202,7 @@ public final class BinomTracker {
 
     // MARK: - Click ID Retrieval
 
-    /// Try to get click_id from clipboard (set by landing page).
+    /// Пытаемся прочитать click_id из буфера обмена (туда его записал лендинг).
     private func retrieveClickId(completion: @escaping (String?) -> Void) {
         DispatchQueue.main.async {
             guard UIPasteboard.general.hasStrings else {
@@ -162,8 +213,7 @@ public final class BinomTracker {
             let content = UIPasteboard.general.string ?? ""
             if content.hasPrefix("treck:") {
                 let clickId = String(content.dropFirst(6))
-                self.log("Click ID from clipboard: \(clickId)")
-                // Clear clipboard to be clean
+                // Очищаем буфер обмена
                 UIPasteboard.general.string = ""
                 completion(clickId)
             } else {

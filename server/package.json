@@ -11,7 +11,6 @@
     "express": "^4.18.2",
     "uuid": "^9.0.0",
     "better-sqlite3": "^9.4.3",
-    "node-fetch": "^2.7.0",
-    "ua-parser-js": "^1.0.37"
+    "node-fetch": "^2.7.0"
   }
 }
