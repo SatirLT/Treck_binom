@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  tracker:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - BINOM_URL=${BINOM_URL}
+      - BINOM_API_KEY=${BINOM_API_KEY}
+      - CAMPAIGN_ID=${CAMPAIGN_ID:-1}
+      - BASE_URL=${BASE_URL:-http://localhost:3000}
+      - PORT=3000
+    volumes:
+      - tracker-data:/app/server/data
+    restart: unless-stopped
+
+volumes:
+  tracker-data:
