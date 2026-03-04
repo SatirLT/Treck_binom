@@ -7,10 +7,12 @@
  * 3. Когда iOS SDK сгенерирует такой же хэш — сервер их сматчит
  *
  * Параметры для хэша (одинаковые в Safari и в iOS-приложении):
- * - Ширина экрана в пикселях (screen.width * devicePixelRatio)
- * - Высота экрана в пикселях (screen.height * devicePixelRatio)
- * - Язык устройства (navigator.language, первые 2 символа)
- * - Часовой пояс (Intl.DateTimeFormat().resolvedOptions().timeZone)
+ * - Ширина экрана в пикселях
+ * - Высота экрана в пикселях
+ * - Язык устройства
+ * - Часовой пояс
+ * - Версия iOS (из User-Agent)
+ * - Device Pixel Ratio (масштаб экрана: 2 или 3)
  */
 (function() {
   'use strict';
@@ -29,7 +31,6 @@
 
   /**
    * SHA-256 хэш строки через Web Crypto API.
-   * Возвращает Promise<string> — hex-строку из 64 символов.
    */
   async function sha256(message) {
     var msgBuffer = new TextEncoder().encode(message);
@@ -41,14 +42,33 @@
   }
 
   /**
-   * Собирает параметры устройства и генерирует хэш.
+   * Извлекает версию iOS из User-Agent.
+   *
+   * Safari UA: "...CPU iPhone OS 17_2_1 like Mac OS X..."
+   * Парсим → "17.2.1"
+   * Берём major.minor → "17.2" (patch может обновиться между кликом и установкой)
+   *
+   * В Swift: UIDevice.current.systemVersion → "17.2.1" → берём "17.2"
+   */
+  function getIOSVersion() {
+    var ua = navigator.userAgent;
+    var match = ua.match(/OS (\d+)[_.](\d+)/);
+    if (match) {
+      return match[1] + '.' + match[2]; // "17.2"
+    }
+    return '';
+  }
+
+  /**
+   * Собирает параметры устройства.
    *
    * ВАЖНО: эти же параметры в том же порядке генерируются в iOS SDK.
-   * Формат строки для хэширования: "screenW|screenH|lang|timezone"
+   * Формат строки для хэширования:
+   *   "screenW|screenH|lang|timezone|osVersion|dpr"
    *
    * Примеры:
-   *   iPhone 15 Pro: "1179|2556|ru|Europe/Moscow"
-   *   iPhone 14:     "1170|2532|en|America/New_York"
+   *   iPhone 15 Pro: "1179|2556|ru|Europe/Moscow|17.2|3"
+   *   iPhone SE 3:   "750|1334|en|America/New_York|17.2|2"
    */
   function getDeviceParams() {
     // Реальные пиксели экрана (как в iOS: bounds * scale)
@@ -56,9 +76,7 @@
     var screenW = Math.round(screen.width * dpr);
     var screenH = Math.round(screen.height * dpr);
 
-    // Язык — берём только код языка (первые 2 символа)
-    // iOS: Locale.current.languageCode = "ru"
-    // Safari: navigator.language = "ru-RU" → берём "ru"
+    // Язык — только код языка (первые 2 символа)
     var lang = (navigator.language || navigator.userLanguage || 'en');
     lang = lang.split('-')[0].toLowerCase();
 
@@ -68,11 +86,19 @@
       tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
     } catch (e) {}
 
+    // Версия iOS (major.minor)
+    var osVersion = getIOSVersion();
+
+    // Device Pixel Ratio как целое число (2 или 3 на iOS)
+    var dprInt = String(Math.round(dpr));
+
     return {
       screenW: String(screenW),
       screenH: String(screenH),
       lang: lang,
       timezone: tz,
+      osVersion: osVersion,
+      dpr: dprInt,
     };
   }
 
@@ -82,9 +108,8 @@
    */
   async function generateClientHash() {
     var p = getDeviceParams();
-    var raw = p.screenW + '|' + p.screenH + '|' + p.lang + '|' + p.timezone;
+    var raw = [p.screenW, p.screenH, p.lang, p.timezone, p.osVersion, p.dpr].join('|');
     var hash = await sha256(raw);
-    // Берём первые 32 символа (128 бит — достаточно для матчинга)
     return hash.substring(0, 32);
   }
 
@@ -97,10 +122,6 @@
 
   // ======= ОТПРАВКА ДАННЫХ НА СЕРВЕР =======
 
-  /**
-   * Отправляет клиентский хэш и параметры на сервер.
-   * Сервер сохранит client_hash привязанным к click_id.
-   */
   async function sendFingerprint() {
     var clickId = getClickId();
     if (!clickId) return;
@@ -111,11 +132,13 @@
     var data = {
       click_id: clickId,
       client_hash: clientHash,
-      // Отправляем и сырые параметры — для fallback-матчинга на сервере
+      // Сырые параметры для fallback-матчинга
       screen_width: params.screenW,
       screen_height: params.screenH,
       language: params.lang,
       timezone: params.timezone,
+      os_version: params.osVersion,
+      dpr: params.dpr,
     };
 
     var url = CONFIG.serverUrl + '/click/fingerprint';
@@ -133,17 +156,12 @@
         }).catch(function() {});
       }
     } catch (e) {
-      // Silent fail — best effort
+      // Silent fail
     }
   }
 
   // ======= ПЕРЕДАЧА CLICK_ID В iOS-ПРИЛОЖЕНИЕ =======
 
-  /**
-   * Копирует click_id в буфер обмена при нажатии кнопки.
-   * iOS SDK прочитает его при первом запуске приложения.
-   * Формат: "treck:UUID" — чтобы отличить от обычного текста.
-   */
   function copyClickIdToClipboard(clickId) {
     if (!clickId || !navigator.clipboard) return;
     try {
@@ -157,22 +175,18 @@
     e.preventDefault();
     var clickId = getClickId();
 
-    // Копируем click_id в буфер обмена
     copyClickIdToClipboard(clickId);
 
-    // Добавляем click_id в ссылку App Store (через campaign token)
     var storeUrl = CONFIG.appStoreUrl;
     if (clickId) {
       var separator = storeUrl.indexOf('?') >= 0 ? '&' : '?';
       storeUrl += separator + 'ct=' + encodeURIComponent(clickId);
     }
 
-    // Пробуем deep link (если приложение уже установлено)
     if (CONFIG.appScheme) {
       var deepLink = CONFIG.appScheme + 'open?click_id=' + encodeURIComponent(clickId || '');
       window.location.href = deepLink;
 
-      // Если приложение не открылось за 1.5с — идём в App Store
       setTimeout(function() {
         window.location.href = storeUrl;
       }, 1500);
@@ -184,10 +198,8 @@
   // ======= ИНИЦИАЛИЗАЦИЯ =======
 
   function init() {
-    // Отправляем клиентский хэш на сервер
     sendFingerprint();
 
-    // Навешиваем обработчик на кнопку
     var btn = document.getElementById('downloadBtn');
     if (btn) {
       btn.addEventListener('click', handleDownload);

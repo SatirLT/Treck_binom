@@ -11,7 +11,6 @@ if (!fs.existsSync(dataDir)) {
 
 const db = new Database(config.dbPath);
 
-// Enable WAL mode for better concurrent read performance
 db.pragma('journal_mode = WAL');
 
 // Create tables
@@ -28,6 +27,8 @@ db.exec(`
     screen_height TEXT,
     language TEXT,
     timezone TEXT,
+    os_version TEXT,
+    dpr TEXT,
     sub_params TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     status TEXT DEFAULT 'clicked'
@@ -51,11 +52,13 @@ db.exec(`
     device_model TEXT,
     screen_width TEXT,
     screen_height TEXT,
+    dpr TEXT,
     language TEXT,
     timezone TEXT,
     ip TEXT,
     matched_click_id TEXT,
     match_method TEXT,
+    attribution_status TEXT DEFAULT 'organic',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     postback_sent INTEGER DEFAULT 0,
     FOREIGN KEY (matched_click_id) REFERENCES clicks(click_id)
@@ -63,6 +66,7 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_installs_client_hash ON installs(client_hash);
   CREATE INDEX IF NOT EXISTS idx_installs_device_id ON installs(device_id);
+  CREATE INDEX IF NOT EXISTS idx_installs_idfv ON installs(idfv);
 `);
 
 // === Prepared statements ===
@@ -76,7 +80,7 @@ const findClickById = db.prepare(`
   SELECT * FROM clicks WHERE click_id = @click_id
 `);
 
-// Метод 1: Поиск по client_hash (хэш с лендинга = хэш из приложения)
+// Ступень 2: Поиск по client_hash
 const findClickByClientHash = db.prepare(`
   SELECT * FROM clicks
   WHERE client_hash = @client_hash AND client_hash IS NOT NULL
@@ -85,7 +89,19 @@ const findClickByClientHash = db.prepare(`
   LIMIT 1
 `);
 
-// Метод 2: Поиск по IP + разрешение экрана + язык + таймзона
+// Ступень 3: IP + экран + язык + таймзона + OS version
+const findClickByIpAndAllParams = db.prepare(`
+  SELECT * FROM clicks
+  WHERE ip = @ip
+    AND screen_width = @screen_width AND screen_height = @screen_height
+    AND language = @language AND timezone = @timezone
+    AND os_version = @os_version
+    AND status = 'clicked'
+  ORDER BY created_at DESC
+  LIMIT 1
+`);
+
+// Ступень 4: IP + экран + язык + таймзона (без OS version)
 const findClickByIpAndParams = db.prepare(`
   SELECT * FROM clicks
   WHERE ip = @ip
@@ -96,7 +112,7 @@ const findClickByIpAndParams = db.prepare(`
   LIMIT 1
 `);
 
-// Метод 3: Поиск по IP + разрешение экрана (без языка и таймзоны)
+// Ступень 5: IP + экран
 const findClickByIpAndScreen = db.prepare(`
   SELECT * FROM clicks
   WHERE ip = @ip
@@ -106,11 +122,31 @@ const findClickByIpAndScreen = db.prepare(`
   LIMIT 1
 `);
 
-// Метод 4: Поиск только по IP (последний шанс, наименее точный)
+// Ступень 6: Только IP
 const findClickByIp = db.prepare(`
   SELECT * FROM clicks
   WHERE ip = @ip AND status = 'clicked'
   ORDER BY created_at DESC
+  LIMIT 1
+`);
+
+// Поиск установки по device_id или idfv (для /status и /event)
+const findInstallByDevice = db.prepare(`
+  SELECT i.*, c.binom_click_id, c.sub_params as click_sub_params
+  FROM installs i
+  LEFT JOIN clicks c ON i.matched_click_id = c.click_id
+  WHERE i.device_id = @device_id OR i.idfv = @idfv
+  ORDER BY i.created_at DESC
+  LIMIT 1
+`);
+
+// Поиск установки по client_hash (fallback для /status)
+const findInstallByClientHash = db.prepare(`
+  SELECT i.*, c.binom_click_id, c.sub_params as click_sub_params
+  FROM installs i
+  LEFT JOIN clicks c ON i.matched_click_id = c.click_id
+  WHERE i.client_hash = @client_hash AND i.client_hash IS NOT NULL
+  ORDER BY i.created_at DESC
   LIMIT 1
 `);
 
@@ -119,8 +155,8 @@ const updateClickStatus = db.prepare(`
 `);
 
 const insertInstall = db.prepare(`
-  INSERT INTO installs (click_id, client_hash, device_id, idfa, idfv, bundle_id, app_version, os_version, device_model, screen_width, screen_height, language, timezone, ip, matched_click_id, match_method)
-  VALUES (@click_id, @client_hash, @device_id, @idfa, @idfv, @bundle_id, @app_version, @os_version, @device_model, @screen_width, @screen_height, @language, @timezone, @ip, @matched_click_id, @match_method)
+  INSERT INTO installs (click_id, client_hash, device_id, idfa, idfv, bundle_id, app_version, os_version, device_model, screen_width, screen_height, dpr, language, timezone, ip, matched_click_id, match_method, attribution_status)
+  VALUES (@click_id, @client_hash, @device_id, @idfa, @idfv, @bundle_id, @app_version, @os_version, @device_model, @screen_width, @screen_height, @dpr, @language, @timezone, @ip, @matched_click_id, @match_method, @attribution_status)
 `);
 
 const markPostbackSent = db.prepare(`
@@ -132,9 +168,12 @@ module.exports = {
   insertClick,
   findClickById,
   findClickByClientHash,
+  findClickByIpAndAllParams,
   findClickByIpAndParams,
   findClickByIpAndScreen,
   findClickByIp,
+  findInstallByDevice,
+  findInstallByClientHash,
   updateClickStatus,
   insertInstall,
   markPostbackSent,

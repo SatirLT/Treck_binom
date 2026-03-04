@@ -1,8 +1,8 @@
 import UIKit
 import BinomTracker
 
-/// Example AppDelegate showing BinomTracker integration.
-/// Copy the relevant parts to your app's AppDelegate.
+/// Пример интеграции BinomTracker в приложение.
+/// Скопируйте нужные части в свой AppDelegate.
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
 
@@ -11,31 +11,75 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
 
-        // Step 1: Configure tracker with your server URL
+        // Шаг 1: Настраиваем трекер
         BinomTracker.shared.configure(
             serverURL: "https://your-tracking-server.com",
-            debug: true  // Set to false in production
+            debug: true  // false в продакшене
         )
 
-        // Step 2: Track install (only fires on first launch)
-        BinomTracker.shared.trackInstall { success in
-            print("Install tracked: \(success)")
+        // Шаг 2: Трекаем установку (сработает 1 раз)
+        // Возвращает статус: organic / non-organic
+        BinomTracker.shared.trackInstall { status in
+            guard let status = status else {
+                print("Не удалось отследить установку")
+                return
+            }
+
+            print("Установка: \(status.status)")          // "organic" или "non-organic"
+            print("Метод матчинга: \(status.matchMethod)") // "client_hash", "click_id" и т.д.
+
+            if status.isNonOrganic {
+                print("Пришёл с рекламы! Источник: \(status.campaignData["source"] ?? "unknown")")
+            }
         }
 
         return true
     }
 }
 
-// MARK: - Event Tracking Examples
+// MARK: - Проверка статуса для воронок
 
 extension AppDelegate {
 
-    /// Call after user completes registration
+    /// Вызывайте в нужный момент, чтобы решить какую воронку показать.
+    /// Например, на экране онбординга.
+    func decideOnboardingFlow() {
+        BinomTracker.shared.checkStatus { status in
+            DispatchQueue.main.async {
+                if status.isNonOrganic {
+                    // Пользователь пришёл с рекламы →
+                    // показываем воронку для рекламного трафика
+                    self.showAdFunnel(source: status.campaignData["source"])
+                } else {
+                    // Organic пользователь →
+                    // стандартный онбординг
+                    self.showStandardOnboarding()
+                }
+            }
+        }
+    }
+
+    func showAdFunnel(source: String?) {
+        // Ваш код для рекламной воронки
+        print("Показываем рекламную воронку, источник: \(source ?? "unknown")")
+    }
+
+    func showStandardOnboarding() {
+        // Ваш код для обычного онбординга
+        print("Показываем стандартный онбординг")
+    }
+}
+
+// MARK: - Трекинг событий
+
+extension AppDelegate {
+
+    /// После регистрации
     func onUserRegistered() {
         BinomTracker.shared.trackEvent(name: "registration")
     }
 
-    /// Call after in-app purchase
+    /// После покупки
     func onPurchase(productId: String, amount: Double) {
         BinomTracker.shared.trackEvent(
             name: "purchase",
@@ -44,7 +88,7 @@ extension AppDelegate {
         )
     }
 
-    /// Call on any custom event
+    /// Любое кастомное событие
     func onLevelComplete(level: Int) {
         BinomTracker.shared.trackEvent(
             name: "level_complete",

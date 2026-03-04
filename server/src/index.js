@@ -16,50 +16,41 @@ app.use('/landing', express.static(path.join(__dirname, '..', '..', 'landing')))
 // Trust proxy for correct IP detection
 app.set('trust proxy', true);
 
-// CORS for landing page requests
+// CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-/**
- * GET /click
- *
- * Точка входа. Пользователь приходит с рекламы.
- * 1. Сохраняем IP, User-Agent
- * 2. Генерируем click_id
- * 3. Регистрируем клик в Binom
- * 4. Редирект на лендинг (где сгенерируется client_hash)
- */
+// =====================================================================
+// GET /click — Точка входа. Пользователь приходит с рекламы.
+// =====================================================================
 app.get('/click', async (req, res) => {
   try {
     const ip = req.ip || req.connection.remoteAddress;
     const userAgent = req.headers['user-agent'] || '';
     const referer = req.headers['referer'] || req.query.ref || '';
 
-    // Собираем sub-параметры из query string
+    // Собираем sub-параметры
     const subParams = {};
     for (let i = 1; i <= 15; i++) {
       const key = `sub${i}`;
       if (req.query[key]) subParams[key] = req.query[key];
     }
-    ['clickid', 'campaign_id', 'source', 'creative_id', 'adset_id'].forEach(key => {
+    ['clickid', 'campaign_id', 'source', 'creative_id', 'adset_id', 'ad_id', 'placement'].forEach(key => {
       if (req.query[key]) subParams[key] = req.query[key];
     });
 
     const clickId = uuidv4();
 
-    // Регистрируем клик в Binom (async, не блокируем редирект)
+    // Регистрируем клик в Binom (async)
     const binomClickIdPromise = binom.registerClick({
-      ip,
-      userAgent,
-      referer,
-      subParams,
+      ip, userAgent, referer, subParams,
     });
 
-    // Сохраняем клик в локальную БД
-    // client_hash пока null — обновится когда лендинг пришлёт данные
+    // Сохраняем клик в БД
     db.insertClick.run({
       click_id: clickId,
       binom_click_id: null,
@@ -70,7 +61,7 @@ app.get('/click', async (req, res) => {
       sub_params: JSON.stringify(subParams),
     });
 
-    // Обновляем binom_click_id когда Binom ответит
+    // Обновляем binom_click_id
     binomClickIdPromise.then(binomClickId => {
       if (binomClickId) {
         db.db.prepare('UPDATE clicks SET binom_click_id = ? WHERE click_id = ?')
@@ -78,7 +69,6 @@ app.get('/click', async (req, res) => {
       }
     }).catch(() => {});
 
-    // Редирект на лендинг с click_id
     const landingUrl = `${config.server.baseUrl}/landing/index.html?click_id=${clickId}`;
     res.redirect(302, landingUrl);
   } catch (error) {
@@ -87,16 +77,12 @@ app.get('/click', async (req, res) => {
   }
 });
 
-/**
- * POST /click/fingerprint
- *
- * Вызывается JS-скриптом лендинга.
- * Лендинг генерирует client_hash на стороне клиента и отправляет сюда.
- * Сервер сохраняет client_hash привязанным к click_id.
- */
+// =====================================================================
+// POST /click/fingerprint — Лендинг отправляет client_hash + параметры
+// =====================================================================
 app.post('/click/fingerprint', (req, res) => {
   try {
-    const { click_id, client_hash, screen_width, screen_height, language, timezone } = req.body;
+    const { click_id, client_hash, screen_width, screen_height, language, timezone, os_version, dpr } = req.body;
 
     if (!click_id) {
       return res.status(400).json({ error: 'click_id required' });
@@ -107,10 +93,10 @@ app.post('/click/fingerprint', (req, res) => {
       return res.status(404).json({ error: 'Click not found' });
     }
 
-    // Сохраняем client_hash и параметры устройства
     db.db.prepare(`
       UPDATE clicks
-      SET client_hash = ?, screen_width = ?, screen_height = ?, language = ?, timezone = ?
+      SET client_hash = ?, screen_width = ?, screen_height = ?,
+          language = ?, timezone = ?, os_version = ?, dpr = ?
       WHERE click_id = ?
     `).run(
       client_hash || null,
@@ -118,10 +104,12 @@ app.post('/click/fingerprint', (req, res) => {
       screen_height || null,
       language || null,
       timezone || null,
+      os_version || null,
+      dpr || null,
       click_id
     );
 
-    console.log(`Fingerprint saved: click=${click_id}, hash=${client_hash}`);
+    console.log(`Fingerprint saved: click=${click_id}, hash=${client_hash}, os=${os_version}, dpr=${dpr}`);
     res.json({ status: 'ok', client_hash });
   } catch (error) {
     console.error('Fingerprint update error:', error);
@@ -129,45 +117,25 @@ app.post('/click/fingerprint', (req, res) => {
   }
 });
 
-/**
- * POST /install
- *
- * Вызывается iOS SDK при первом запуске приложения.
- *
- * МНОГОСТУПЕНЧАТЫЙ МАТЧИНГ:
- *
- * Ступень 1: click_id (точность ~99%)
- *   Если iOS SDK достал click_id из буфера обмена — ищем по нему.
- *
- * Ступень 2: client_hash (точность ~95%)
- *   Хэш, сгенерированный на лендинге = хэш, сгенерированный в iOS SDK.
- *   Параметры: screenW + screenH + language + timezone
- *
- * Ступень 3: IP + экран + язык + таймзона (точность ~85%)
- *   Если хэш не найден (лендинг не успел отправить) — ищем по сырым параметрам.
- *
- * Ступень 4: IP + экран (точность ~70%)
- *   Менее точный fallback.
- *
- * Ступень 5: Только IP (точность ~40%)
- *   Последний шанс. Много ложных срабатываний, но лучше чем ничего.
- */
+// =====================================================================
+// POST /install — iOS SDK регистрирует установку
+//
+// МНОГОСТУПЕНЧАТЫЙ МАТЧИНГ:
+//   1. click_id (из clipboard)             — точность ~99%
+//   2. client_hash (одинаковый хэш)        — точность ~95%
+//   3. IP + экран + язык + TZ + OS version — точность ~90%
+//   4. IP + экран + язык + TZ             — точность ~80%
+//   5. IP + экран                          — точность ~65%
+//   6. Только IP                           — точность ~35%
+// =====================================================================
 app.post('/install', async (req, res) => {
   try {
     const {
-      click_id,       // Из буфера обмена (если удалось достать)
-      client_hash,    // Хэш устройства (сгенерирован в iOS SDK)
-      device_id,
-      idfa,
-      idfv,
-      bundle_id,
-      app_version,
-      os_version,
-      device_model,
-      screen_width,
-      screen_height,
-      language,
-      timezone,
+      click_id, client_hash,
+      device_id, idfa, idfv,
+      bundle_id, app_version, os_version, os_version_full,
+      device_model, screen_width, screen_height, dpr,
+      language, timezone,
     } = req.body;
 
     const ip = req.ip || req.connection.remoteAddress;
@@ -175,66 +143,74 @@ app.post('/install', async (req, res) => {
     let matchedClick = null;
     let matchMethod = 'none';
 
-    // === СТУПЕНЬ 1: Прямой click_id (самый точный) ===
-    if (click_id) {
+    // === СТУПЕНЬ 1: click_id ===
+    if (!matchedClick && click_id) {
       matchedClick = db.findClickById.get({ click_id });
       if (matchedClick) {
         matchMethod = 'click_id';
-        console.log(`Match by click_id: ${click_id}`);
+        console.log(`[MATCH] click_id: ${click_id}`);
       }
     }
 
-    // === СТУПЕНЬ 2: client_hash (хэш с лендинга = хэш из приложения) ===
+    // === СТУПЕНЬ 2: client_hash ===
     if (!matchedClick && client_hash) {
       matchedClick = db.findClickByClientHash.get({ client_hash });
       if (matchedClick) {
         matchMethod = 'client_hash';
-        console.log(`Match by client_hash: ${client_hash} → click=${matchedClick.click_id}`);
+        console.log(`[MATCH] client_hash: ${client_hash} → click=${matchedClick.click_id}`);
       }
     }
 
-    // === СТУПЕНЬ 3: IP + все параметры экрана ===
+    // === СТУПЕНЬ 3: IP + экран + язык + TZ + OS ===
+    if (!matchedClick && ip && screen_width && screen_height && language && timezone && os_version) {
+      matchedClick = db.findClickByIpAndAllParams.get({
+        ip, screen_width, screen_height, language, timezone, os_version,
+      });
+      if (matchedClick) {
+        matchMethod = 'ip_screen_lang_tz_os';
+        console.log(`[MATCH] IP+all params → click=${matchedClick.click_id}`);
+      }
+    }
+
+    // === СТУПЕНЬ 4: IP + экран + язык + TZ ===
     if (!matchedClick && ip && screen_width && screen_height && language && timezone) {
       matchedClick = db.findClickByIpAndParams.get({
-        ip,
-        screen_width,
-        screen_height,
-        language,
-        timezone,
+        ip, screen_width, screen_height, language, timezone,
       });
       if (matchedClick) {
-        matchMethod = 'ip_and_params';
-        console.log(`Match by IP+params: ${ip}, ${screen_width}x${screen_height} → click=${matchedClick.click_id}`);
+        matchMethod = 'ip_screen_lang_tz';
+        console.log(`[MATCH] IP+screen+lang+tz → click=${matchedClick.click_id}`);
       }
     }
 
-    // === СТУПЕНЬ 4: IP + разрешение экрана ===
+    // === СТУПЕНЬ 5: IP + экран ===
     if (!matchedClick && ip && screen_width && screen_height) {
       matchedClick = db.findClickByIpAndScreen.get({
-        ip,
-        screen_width,
-        screen_height,
+        ip, screen_width, screen_height,
       });
       if (matchedClick) {
-        matchMethod = 'ip_and_screen';
-        console.log(`Match by IP+screen: ${ip}, ${screen_width}x${screen_height} → click=${matchedClick.click_id}`);
+        matchMethod = 'ip_screen';
+        console.log(`[MATCH] IP+screen → click=${matchedClick.click_id}`);
       }
     }
 
-    // === СТУПЕНЬ 5: Только IP (последний шанс) ===
+    // === СТУПЕНЬ 6: Только IP ===
     if (!matchedClick && ip) {
       matchedClick = db.findClickByIp.get({ ip });
       if (matchedClick) {
         matchMethod = 'ip_only';
-        console.log(`Match by IP only: ${ip} → click=${matchedClick.click_id} (low confidence)`);
+        console.log(`[MATCH] IP only → click=${matchedClick.click_id} (low confidence)`);
       }
     }
 
     if (!matchedClick) {
-      console.log(`No match found: hash=${client_hash}, ip=${ip}, screen=${screen_width}x${screen_height}`);
+      console.log(`[NO MATCH] hash=${client_hash}, ip=${ip}, screen=${screen_width}x${screen_height}`);
     }
 
-    // Сохраняем запись об установке
+    // Определяем статус атрибуции
+    const attributionStatus = matchedClick ? 'non-organic' : 'organic';
+
+    // Сохраняем установку
     const installData = {
       click_id: click_id || null,
       client_hash: client_hash || null,
@@ -247,16 +223,18 @@ app.post('/install', async (req, res) => {
       device_model: device_model || null,
       screen_width: screen_width || null,
       screen_height: screen_height || null,
+      dpr: dpr || null,
       language: language || null,
       timezone: timezone || null,
       ip,
       matched_click_id: matchedClick ? matchedClick.click_id : null,
       match_method: matchMethod,
+      attribution_status: attributionStatus,
     };
 
     const result = db.insertInstall.run(installData);
 
-    // Отправляем постбек в Binom, если матч найден
+    // Постбек в Binom
     let postbackSent = false;
     if (matchedClick && matchedClick.binom_click_id) {
       postbackSent = await binom.sendPostback({
@@ -271,11 +249,23 @@ app.post('/install', async (req, res) => {
       }
     }
 
+    // Парсим campaign data из sub_params клика
+    let campaignData = {};
+    if (matchedClick && matchedClick.sub_params) {
+      try { campaignData = JSON.parse(matchedClick.sub_params); } catch (e) {}
+    }
+
     res.json({
       status: 'ok',
+      // === Данные для iOS SDK ===
+      attribution_status: attributionStatus,   // "non-organic" или "organic"
       matched: !!matchedClick,
       match_method: matchMethod,
       postback_sent: postbackSent,
+      // Данные клика (для воронок в приложении)
+      click_id: matchedClick ? matchedClick.click_id : null,
+      binom_click_id: matchedClick ? matchedClick.binom_click_id : null,
+      campaign_data: campaignData,
     });
   } catch (error) {
     console.error('Install handler error:', error);
@@ -283,11 +273,64 @@ app.post('/install', async (req, res) => {
   }
 });
 
-/**
- * POST /event
- *
- * Трекинг in-app событий (регистрация, покупка и т.д.)
- */
+// =====================================================================
+// POST /status — Проверка статуса: Organic или Non-Organic
+//
+// Вызывается iOS SDK в любой момент. Быстрый ответ из БД.
+// Приложение использует это для построения воронок:
+//   non-organic → воронка для рекламного трафика
+//   organic → стандартный онбординг
+// =====================================================================
+app.post('/status', (req, res) => {
+  try {
+    const { device_id, idfv, client_hash } = req.body;
+
+    // Ищем установку по device_id или idfv
+    let install = null;
+    if (device_id || idfv) {
+      install = db.findInstallByDevice.get({
+        device_id: device_id || '',
+        idfv: idfv || '',
+      });
+    }
+
+    // Fallback: поиск по client_hash
+    if (!install && client_hash) {
+      install = db.findInstallByClientHash.get({ client_hash });
+    }
+
+    if (!install) {
+      return res.json({
+        status: 'organic',
+        match_method: 'none',
+        click_id: null,
+        binom_click_id: null,
+        campaign_data: {},
+      });
+    }
+
+    // Парсим campaign data
+    let campaignData = {};
+    if (install.click_sub_params) {
+      try { campaignData = JSON.parse(install.click_sub_params); } catch (e) {}
+    }
+
+    res.json({
+      status: install.attribution_status || (install.matched_click_id ? 'non-organic' : 'organic'),
+      match_method: install.match_method || 'none',
+      click_id: install.matched_click_id || null,
+      binom_click_id: install.binom_click_id || null,
+      campaign_data: campaignData,
+    });
+  } catch (error) {
+    console.error('Status handler error:', error);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// =====================================================================
+// POST /event — Трекинг in-app событий
+// =====================================================================
 app.post('/event', async (req, res) => {
   try {
     const { device_id, idfv, event_name, event_value, payout } = req.body;
@@ -296,12 +339,10 @@ app.post('/event', async (req, res) => {
       return res.status(400).json({ error: 'event_name required' });
     }
 
-    const install = db.db.prepare(`
-      SELECT i.*, c.binom_click_id FROM installs i
-      LEFT JOIN clicks c ON i.matched_click_id = c.click_id
-      WHERE (i.device_id = ? OR i.idfv = ?)
-      ORDER BY i.created_at DESC LIMIT 1
-    `).get(device_id || '', idfv || '');
+    const install = db.findInstallByDevice.get({
+      device_id: device_id || '',
+      idfv: idfv || '',
+    });
 
     if (!install || !install.binom_click_id) {
       return res.json({ status: 'ok', postback_sent: false, reason: 'no_matched_click' });
@@ -321,9 +362,9 @@ app.post('/event', async (req, res) => {
   }
 });
 
-/**
- * GET /stats — Статистика за сегодня
- */
+// =====================================================================
+// GET /stats — Статистика
+// =====================================================================
 app.get('/stats', (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
@@ -344,7 +385,14 @@ app.get('/stats', (req, res) => {
       "SELECT COUNT(*) as count FROM installs WHERE date(created_at) = ? AND postback_sent = 1"
     ).get(today);
 
-    // Статистика по методам матчинга
+    const organic = db.db.prepare(
+      "SELECT COUNT(*) as count FROM installs WHERE date(created_at) = ? AND attribution_status = 'organic'"
+    ).get(today);
+
+    const nonOrganic = db.db.prepare(
+      "SELECT COUNT(*) as count FROM installs WHERE date(created_at) = ? AND attribution_status = 'non-organic'"
+    ).get(today);
+
     const methods = db.db.prepare(`
       SELECT match_method, COUNT(*) as count FROM installs
       WHERE date(created_at) = ? AND match_method != 'none'
@@ -355,6 +403,8 @@ app.get('/stats', (req, res) => {
       date: today,
       clicks: clicks.count,
       installs: installs.count,
+      organic: organic.count,
+      non_organic: nonOrganic.count,
       matched: matched.count,
       postbacks_sent: postbacks.count,
       match_rate: installs.count > 0
