@@ -67,6 +67,28 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_installs_client_hash ON installs(client_hash);
   CREATE INDEX IF NOT EXISTS idx_installs_device_id ON installs(device_id);
   CREATE INDEX IF NOT EXISTS idx_installs_idfv ON installs(idfv);
+
+  CREATE TABLE IF NOT EXISTS apphud_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    apphud_event_id TEXT,
+    event_name TEXT NOT NULL,
+    product_id TEXT,
+    price_usd REAL,
+    proceeds_usd REAL,
+    currency TEXT,
+    transaction_id TEXT,
+    original_transaction_id TEXT,
+    apphud_user_id TEXT,
+    binom_click_id TEXT,
+    treck_click_id TEXT,
+    postback_sent INTEGER DEFAULT 0,
+    raw_payload TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_apphud_events_binom_click ON apphud_events(binom_click_id);
+  CREATE INDEX IF NOT EXISTS idx_apphud_events_event_name ON apphud_events(event_name);
+  CREATE INDEX IF NOT EXISTS idx_apphud_events_transaction ON apphud_events(transaction_id);
 `);
 
 // === Prepared statements ===
@@ -163,6 +185,36 @@ const markPostbackSent = db.prepare(`
   UPDATE installs SET postback_sent = 1 WHERE id = @id
 `);
 
+// === Apphud events ===
+
+const insertApphudEvent = db.prepare(`
+  INSERT INTO apphud_events (
+    apphud_event_id, event_name, product_id, price_usd, proceeds_usd,
+    currency, transaction_id, original_transaction_id,
+    apphud_user_id, binom_click_id, treck_click_id,
+    postback_sent, raw_payload
+  ) VALUES (
+    @apphud_event_id, @event_name, @product_id, @price_usd, @proceeds_usd,
+    @currency, @transaction_id, @original_transaction_id,
+    @apphud_user_id, @binom_click_id, @treck_click_id,
+    @postback_sent, @raw_payload
+  )
+`);
+
+const markApphudPostbackSent = db.prepare(`
+  UPDATE apphud_events SET postback_sent = 1 WHERE id = @id
+`);
+
+// Поиск установки по treck_click_id (для fallback если binom_click_id не пришёл)
+const findInstallByClickId = db.prepare(`
+  SELECT i.*, c.binom_click_id, c.sub_params as click_sub_params
+  FROM installs i
+  LEFT JOIN clicks c ON i.matched_click_id = c.click_id
+  WHERE i.matched_click_id = @click_id
+  ORDER BY i.created_at DESC
+  LIMIT 1
+`);
+
 module.exports = {
   db,
   insertClick,
@@ -174,7 +226,10 @@ module.exports = {
   findClickByIp,
   findInstallByDevice,
   findInstallByClientHash,
+  findInstallByClickId,
   updateClickStatus,
   insertInstall,
   markPostbackSent,
+  insertApphudEvent,
+  markApphudPostbackSent,
 };

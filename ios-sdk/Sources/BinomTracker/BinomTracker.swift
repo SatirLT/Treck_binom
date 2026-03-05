@@ -118,6 +118,7 @@ public final class BinomTracker {
     /// Отправляет постбек только один раз (при первом запуске после установки).
     ///
     /// Completion возвращает BinomInstallStatus — используйте его для воронок.
+    /// Если интегрирован Apphud — автоматически прокинет атрибуцию.
     public func trackInstall(completion: ((BinomInstallStatus?) -> Void)? = nil) {
         guard isConfigured else {
             log("Error: BinomTracker not configured. Call configure() first.")
@@ -166,6 +167,8 @@ public final class BinomTracker {
                     // Кэшируем статус
                     if let status = installStatus {
                         self.cacheStatus(status)
+                        // Прокидываем атрибуцию в Apphud
+                        self.syncToApphud(status: status)
                     }
 
                     self.log("Install tracked: \(installStatus?.status ?? "unknown")")
@@ -173,6 +176,94 @@ public final class BinomTracker {
 
                 completion?(installStatus)
             }
+        }
+    }
+
+    // MARK: - Apphud Integration
+
+    /// Прокидывает данные атрибуции в Apphud через setAttribution и setUserProperty.
+    ///
+    /// Apphud Connection Builder использует user_properties для формирования
+    /// вебхуков на наш сервер. Так покупки в Apphud связываются с кликами в Binom.
+    ///
+    /// Устанавливаемые свойства:
+    ///   - binom_click_id → для постбека в Binom при покупке
+    ///   - treck_click_id → наш внутренний click_id
+    ///   - attribution_status → "non-organic" / "organic"
+    ///   - match_method → как сматчили (client_hash, click_id, и т.д.)
+    ///   - campaign_source → источник из sub-параметров
+    private func syncToApphud(status: BinomInstallStatus) {
+        // Проверяем, доступен ли Apphud SDK (runtime check, без жёсткой зависимости)
+        guard let apphudClass = NSClassFromString("Apphud") else {
+            log("Apphud SDK not found, skipping attribution sync")
+            return
+        }
+
+        log("Syncing attribution to Apphud...")
+
+        // 1. Ставим User Properties — они будут доступны через
+        //    {{ user.user_properties.binom_click_id }} в Connection Builder
+        let properties: [(String, String?)] = [
+            ("binom_click_id", status.binomClickId),
+            ("treck_click_id", status.clickId),
+            ("attribution_status", status.status),
+            ("match_method", status.matchMethod),
+            ("campaign_source", status.campaignData["source"]),
+            ("campaign_id", status.campaignData["campaign_id"]),
+            ("creative_id", status.campaignData["creative_id"]),
+            ("adset_id", status.campaignData["adset_id"]),
+            ("treck_device_id", getDeviceId()),
+        ]
+
+        for (key, value) in properties {
+            guard let value = value, !value.isEmpty else { continue }
+            setApphudUserProperty(apphudClass: apphudClass, key: key, value: value)
+        }
+
+        // 2. Прокидываем custom attribution data — появится в Apphud Charts
+        var attributionData: [String: Any] = [
+            "attribution_status": status.status,
+            "match_method": status.matchMethod,
+        ]
+        if let clickId = status.clickId {
+            attributionData["click_id"] = clickId
+        }
+        if let binomClickId = status.binomClickId {
+            attributionData["binom_click_id"] = binomClickId
+        }
+        for (key, value) in status.campaignData {
+            attributionData[key] = value
+        }
+
+        setApphudAttribution(apphudClass: apphudClass, data: attributionData)
+
+        log("Attribution synced to Apphud: \(attributionData)")
+    }
+
+    /// Вызывает Apphud.setUserProperty(key:value:setOnce:) через Objective-C runtime.
+    /// Это позволяет не добавлять жёсткую зависимость на ApphudSDK.
+    private func setApphudUserProperty(apphudClass: AnyClass, key: String, value: String) {
+        let selector = NSSelectorFromString("setUserPropertyWithKey:value:setOnce:")
+        guard let method = class_getClassMethod(apphudClass, selector) else {
+            // Fallback: пробуем через perform
+            let sel2 = NSSelectorFromString("setUserProperty:value:setOnce:")
+            if apphudClass.responds(to: sel2) {
+                _ = (apphudClass as AnyObject).perform(sel2, with: key, with: value)
+            }
+            return
+        }
+        let imp = method_getImplementation(method)
+        typealias Function = @convention(c) (AnyObject, Selector, Any, Any, Bool) -> Void
+        let function = unsafeBitCast(imp, to: Function.self)
+        function(apphudClass, selector, key, value, true)
+    }
+
+    /// Вызывает Apphud.setAttribution(data:from:identifier:) через runtime.
+    private func setApphudAttribution(apphudClass: AnyClass, data: [String: Any]) {
+        // ApphudAttributionProvider.custom = 5 (enum value)
+        let selector = NSSelectorFromString("setAttributionWithData:from:identifier:callback:")
+        if apphudClass.responds(to: selector) {
+            _ = (apphudClass as AnyObject).perform(selector, with: data, with: NSNumber(value: 5))
         }
     }
 

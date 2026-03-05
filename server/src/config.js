@@ -30,6 +30,13 @@ module.exports = {
     landingId: process.env.LANDING_ID || '1',
   },
 
+  // Apphud settings (для приёма вебхуков покупок)
+  apphud: {
+    // Secret token — указывается в Apphud Dashboard → Webhooks/Connection Builder
+    // Apphud отправляет его в заголовке X-Apphud-Token
+    secretToken: process.env.APPHUD_SECRET_TOKEN || '',
+  },
+
   // Server settings
   server: {
     port: parseInt(process.env.PORT, 10) || 3000,

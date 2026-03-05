@@ -363,6 +363,133 @@ app.post('/event', async (req, res) => {
 });
 
 // =====================================================================
+// POST /apphud/webhook — Приём событий покупок из Apphud
+//
+// Apphud Connection Builder шлёт сюда POST с данными о покупке.
+// Мы извлекаем binom_click_id из user_properties и шлём постбек в Binom.
+//
+// Поток:
+//   Покупка в App → Apphud обрабатывает → Connection Builder POST сюда
+//   → Извлекаем binom_click_id → Постбек в Binom (purchase + revenue)
+//
+// Connection Builder шаблон (настраивается в Apphud Dashboard):
+//   {
+//     "event_id": "{{ event.id }}",
+//     "event_name": "{{ event.name }}",
+//     "product_id": "{{ event.receipt.product_id }}",
+//     "price_usd": {{ event.receipt.price_usd | default: 0 }},
+//     "proceeds_usd": {{ event.receipt.proceeds_usd | default: 0 }},
+//     "currency": "{{ event.receipt.currency }}",
+//     "transaction_id": "{{ event.receipt.transaction_id }}",
+//     "original_transaction_id": "{{ event.receipt.original_transaction_id }}",
+//     "user_id": "{{ user.user_id }}",
+//     "binom_click_id": "{{ user.user_properties.binom_click_id }}",
+//     "treck_click_id": "{{ user.user_properties.treck_click_id }}",
+//     "attribution_status": "{{ user.user_properties.attribution_status }}",
+//     "campaign_source": "{{ user.user_properties.campaign_source }}"
+//   }
+// =====================================================================
+app.post('/apphud/webhook', async (req, res) => {
+  try {
+    // Проверяем секретный токен (если настроен)
+    if (config.apphud.secretToken) {
+      const token = req.headers['x-apphud-token'] || '';
+      if (token !== config.apphud.secretToken) {
+        console.warn('Apphud webhook: invalid token');
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+    }
+
+    const {
+      event_id, event_name,
+      product_id, price_usd, proceeds_usd, currency,
+      transaction_id, original_transaction_id,
+      user_id,
+      binom_click_id, treck_click_id,
+      attribution_status,
+    } = req.body;
+
+    console.log(`[APPHUD] Event: ${event_name}, product=${product_id}, price=$${price_usd}, binom_click=${binom_click_id || 'none'}`);
+
+    // Определяем binom_click_id (может прийти напрямую или через поиск по treck_click_id)
+    let resolvedBinomClickId = binom_click_id || null;
+
+    // Fallback: если binom_click_id не пришёл, ищем по treck_click_id
+    if (!resolvedBinomClickId && treck_click_id) {
+      const install = db.findInstallByClickId.get({ click_id: treck_click_id });
+      if (install && install.binom_click_id) {
+        resolvedBinomClickId = install.binom_click_id;
+        console.log(`[APPHUD] Resolved binom_click_id via treck_click_id: ${resolvedBinomClickId}`);
+      }
+    }
+
+    // Маппинг событий Apphud → статусы для Binom
+    const eventMap = {
+      'trial_started': { status: 'trial', payout: 0 },
+      'trial_converted': { status: 'purchase', payout: null },
+      'subscription_started': { status: 'purchase', payout: null },
+      'subscription_renewed': { status: 'rebill', payout: null },
+      'non_renewing_purchase': { status: 'purchase', payout: null },
+      'subscription_refunded': { status: 'refund', payout: null },
+      'trial_expired': { status: 'trial_expired', payout: 0 },
+      'subscription_expired': { status: 'unsubscribe', payout: 0 },
+      'subscription_canceled': { status: 'cancel', payout: 0 },
+    };
+
+    const mapped = eventMap[event_name] || { status: event_name, payout: null };
+    // payout: proceeds (то, что получает разработчик после комиссии Apple)
+    const payout = mapped.payout !== null ? mapped.payout : (proceeds_usd || price_usd || 0);
+
+    // Сохраняем событие
+    let postbackSent = false;
+    const eventData = {
+      apphud_event_id: event_id || null,
+      event_name: event_name || 'unknown',
+      product_id: product_id || null,
+      price_usd: price_usd || 0,
+      proceeds_usd: proceeds_usd || 0,
+      currency: currency || 'USD',
+      transaction_id: transaction_id || null,
+      original_transaction_id: original_transaction_id || null,
+      apphud_user_id: user_id || null,
+      binom_click_id: resolvedBinomClickId,
+      treck_click_id: treck_click_id || null,
+      postback_sent: 0,
+      raw_payload: JSON.stringify(req.body),
+    };
+
+    const result = db.insertApphudEvent.run(eventData);
+
+    // Шлём постбек в Binom
+    if (resolvedBinomClickId) {
+      postbackSent = await binom.sendPostback({
+        binomClickId: resolvedBinomClickId,
+        status: mapped.status,
+        payout,
+        eventName: event_name,
+      });
+
+      if (postbackSent) {
+        db.markApphudPostbackSent.run({ id: result.lastInsertRowid });
+        console.log(`[APPHUD] Postback sent to Binom: click=${resolvedBinomClickId}, status=${mapped.status}, payout=${payout}`);
+      }
+    } else {
+      console.log(`[APPHUD] No binom_click_id — event saved but no postback (organic user)`);
+    }
+
+    res.json({
+      status: 'ok',
+      event_name,
+      postback_sent: postbackSent,
+      binom_click_id: resolvedBinomClickId,
+    });
+  } catch (error) {
+    console.error('Apphud webhook error:', error);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// =====================================================================
 // GET /stats — Статистика
 // =====================================================================
 app.get('/stats', (req, res) => {
@@ -399,6 +526,25 @@ app.get('/stats', (req, res) => {
       GROUP BY match_method
     `).all(today);
 
+    // Apphud events stats
+    const apphudEvents = db.db.prepare(
+      "SELECT COUNT(*) as count FROM apphud_events WHERE date(created_at) = ?"
+    ).get(today);
+
+    const apphudRevenue = db.db.prepare(
+      "SELECT COALESCE(SUM(proceeds_usd), 0) as total FROM apphud_events WHERE date(created_at) = ? AND event_name IN ('subscription_started', 'trial_converted', 'subscription_renewed', 'non_renewing_purchase')"
+    ).get(today);
+
+    const apphudPostbacks = db.db.prepare(
+      "SELECT COUNT(*) as count FROM apphud_events WHERE date(created_at) = ? AND postback_sent = 1"
+    ).get(today);
+
+    const apphudByEvent = db.db.prepare(`
+      SELECT event_name, COUNT(*) as count, COALESCE(SUM(proceeds_usd), 0) as revenue
+      FROM apphud_events WHERE date(created_at) = ?
+      GROUP BY event_name
+    `).all(today);
+
     res.json({
       date: today,
       clicks: clicks.count,
@@ -414,6 +560,15 @@ app.get('/stats', (req, res) => {
         acc[m.match_method] = m.count;
         return acc;
       }, {}),
+      apphud: {
+        events: apphudEvents.count,
+        revenue_usd: Number(apphudRevenue.total.toFixed(2)),
+        postbacks_sent: apphudPostbacks.count,
+        by_event: apphudByEvent.reduce((acc, e) => {
+          acc[e.event_name] = { count: e.count, revenue: Number(e.revenue.toFixed(2)) };
+          return acc;
+        }, {}),
+      },
     });
   } catch (error) {
     console.error('Stats error:', error);
