@@ -1,100 +1,135 @@
-# Treck Binom — Трекинг установок iOS-приложений
+# Treck Binom — Трекинг установок iOS-приложений + покупки через Apphud
 
 ## Что это такое и зачем нужно?
 
-Представь: ты запускаешь рекламу своего iOS-приложения в интернете (Facebook, TikTok, Google и т.д.). Люди кликают на рекламу, переходят на страницу, скачивают приложение из App Store. Но как узнать, **какая именно реклама** привела к установке? Ведь App Store не говорит, откуда пришёл пользователь.
+Представь: ты запускаешь рекламу своего iOS-приложения (Facebook, TikTok, Google и т.д.). Люди кликают, скачивают приложение, покупают подписку. Но как узнать:
+- **Какая реклама** привела к установке?
+- **Сколько денег** принёс каждый рекламный канал?
+- Пользователь **пришёл с рекламы** или **сам нашёл** приложение?
 
-**Treck Binom** решает эту задачу. Это система из трёх частей, которая:
-1. Запоминает, откуда пришёл пользователь (с какой рекламы)
-2. Когда он установит приложение — находит его в базе
-3. Отправляет данные в трекер Binom, чтобы ты видел статистику
+**Treck Binom** решает все три задачи:
+
+1. **Запоминает** откуда пришёл пользователь (с какой рекламы, кампании)
+2. **Матчит** — когда человек установит приложение, находит его в базе
+3. **Определяет статус** — Organic (сам нашёл) или Non-Organic (пришёл с рекламы)
+4. **Связывает покупки** — через Apphud привязывает подписки/покупки к кликам
+5. **Отправляет в Binom** — установки и покупки с revenue, чтобы считать ROI
 
 ---
 
 ## Как это работает? (простым языком)
 
 ```
-Шаг 1: Пользователь видит рекламу и кликает на неё
+ФАЗА 1: КЛИК И УСТАНОВКА
+
+  Пользователь видит рекламу → кликает
          │
          ▼
-Шаг 2: Попадает на наш СЕРВЕР (/click)
-        Сервер запоминает: IP-адрес, модель телефона, время
-        Генерирует уникальный click_id (как номерок в очереди)
+  GET /click — наш сервер запоминает: IP, устройство, время
+  Генерирует click_id + отправляет клик в Binom (получает binom_click_id)
          │
          ▼
-Шаг 3: Перенаправляется на ЛЕНДИНГ (красивая страница)
-        Лендинг собирает дополнительные данные: размер экрана, язык, часовой пояс
-        Копирует click_id в буфер обмена телефона (как Ctrl+C)
+  Лендинг — красивая страница с кнопкой "Скачать"
+  tracker.js собирает: размер экрана, язык, часовой пояс, версию iOS
+  Генерирует ХЭШ устройства (уникальный отпечаток)
+  Копирует click_id в буфер обмена (как Ctrl+C)
          │
          ▼
-Шаг 4: Нажимает "Скачать" → уходит в App Store
+  App Store → пользователь скачивает приложение
          │
          ▼
-Шаг 5: Устанавливает приложение и открывает его
+  Первый запуск приложения
+  BinomTracker.trackInstall():
+    - Читает click_id из буфера обмена (Ctrl+V)
+    - Генерирует ТАКОЙ ЖЕ хэш устройства
+    - Отправляет на сервер POST /install
          │
          ▼
-Шаг 6: iOS SDK (наш код внутри приложения) при первом запуске:
-        - Читает click_id из буфера обмена (как Ctrl+V)
-        - Собирает данные об устройстве
-        - Отправляет всё на СЕРВЕР (/install)
+  Сервер МАТЧИТ: "Этот хэш совпадает с хэшем от лендинга!"
+  Отвечает: "Non-Organic, binom_click_id = xyz, source = facebook"
          │
          ▼
-Шаг 7: Сервер МАТЧИТ (сопоставляет) установку с кликом
-        "Ага, это тот самый человек, который кликнул рекламу!"
+  Постбек в Binom: "С рекламы X получена 1 установка"
+
+
+ФАЗА 2: ПОКУПКИ (ЧЕРЕЗ APPHUD)
+
+  Пользователь покупает подписку в приложении
          │
          ▼
-Шаг 8: Сервер отправляет ПОСТБЕК в Binom
-        Binom записывает: "С рекламы X получена 1 установка"
+  Apphud обрабатывает транзакцию (Apple → Apphud)
+         │
+         ▼
+  Apphud Connection Builder отправляет POST /apphud/webhook
+  В запросе: event_name, price, proceeds + binom_click_id из user_properties
+         │
+         ▼
+  Наш сервер получает binom_click_id → шлёт постбек в Binom
+  Binom записывает: "Клик X → Установка → Покупка $6.99"
+         │
+         ▼
+  В Binom видно ROI: потратил $2 на рекламу → получил $6.99 = ROI 249%
+
+
+ФАЗА 3: ВОРОНКИ В ПРИЛОЖЕНИИ
+
+  При запуске приложения вызываем BinomTracker.checkStatus()
+         │
+         ▼
+  Ответ: "non-organic" или "organic"
+         │
+         ├── Non-Organic → показываем агрессивный пейволл (рекламная воронка)
+         │
+         └── Organic → показываем стандартный онбординг
 ```
 
 ---
 
 ## Из чего состоит проект?
 
-Проект — это три отдельных компонента, которые работают вместе:
-
 ```
 Treck_binom/
 │
-├── server/          ← Сервер (мозг системы)
+├── server/             ← СЕРВЕР (мозг системы)
 │   ├── src/
-│   │   ├── index.js        ← Главный файл, запускает сервер
-│   │   ├── config.js       ← Настройки (URL Binom, порт и т.д.)
-│   │   ├── database.js     ← Работа с базой данных (SQLite)
-│   │   ├── binom.js        ← Общение с Binom трекером
-│   │   └── fingerprint.js  ← Генерация "отпечатков" устройств
-│   ├── package.json        ← Список зависимостей Node.js
-│   └── .env.example        ← Пример файла с настройками
+│   │   ├── index.js         ← Все эндпоинты: /click, /install, /status, /apphud/webhook
+│   │   ├── config.js        ← Настройки (Binom URL, Apphud token, порт)
+│   │   ├── database.js      ← База данных SQLite (клики, установки, покупки)
+│   │   └── binom.js         ← Общение с Binom (клики + постбеки)
+│   ├── package.json
+│   └── .env.example         ← Пример файла с настройками
 │
-├── landing/         ← Лендинг (страница для пользователя)
-│   ├── index.html          ← HTML-страница с кнопкой "Скачать"
-│   └── tracker.js          ← Скрипт сбора данных + редирект в App Store
+├── landing/            ← ЛЕНДИНГ (страница для пользователя)
+│   ├── index.html           ← HTML с кнопкой "Скачать"
+│   └── tracker.js           ← Сбор данных + генерация хэша устройства
 │
-├── ios-sdk/         ← iOS SDK (библиотека для приложения)
-│   ├── Package.swift                       ← Описание Swift-пакета
+├── ios-sdk/            ← iOS SDK (библиотека для приложения)
+│   ├── Package.swift
 │   ├── Sources/BinomTracker/
-│   │   └── BinomTracker.swift              ← Код трекера для iOS
+│   │   └── BinomTracker.swift   ← Трекер: установка, статус, события, Apphud
 │   └── Examples/
-│       └── AppDelegate-Example.swift       ← Пример использования
+│       └── AppDelegate-Example.swift
 │
-├── Dockerfile           ← Для запуска в Docker-контейнере
-├── docker-compose.yml   ← Для запуска через Docker Compose
-├── .gitignore           ← Какие файлы НЕ сохранять в Git
-└── README.md            ← Этот файл
+├── docs/               ← ДОКУМЕНТАЦИЯ
+│   └── apphud-connection-builder-setup.md  ← Инструкция по Apphud
+│
+├── Dockerfile
+├── docker-compose.yml
+└── README.md           ← Этот файл
 ```
 
 ---
 
 ## Что нужно для работы?
 
-### На компьютере (для сервера):
-- **Node.js** версии 18 или новее — [скачать тут](https://nodejs.org/)
-- **npm** — устанавливается автоматически вместе с Node.js
-- **Binom трекер** — купленный и настроенный на вашем домене
+### Обязательно:
+- **Node.js 18+** — [скачать](https://nodejs.org/)
+- **Binom трекер** — купленный и настроенный на своём домене
+- **Xcode 14+** — для iOS-разработки (на Mac)
 
-### Для iOS-приложения:
-- **Xcode** версии 14 или новее (на Mac)
-- iOS-приложение, в которое будем встраивать SDK
+### Для покупок (опционально):
+- **Apphud** — [apphud.com](https://apphud.com) (план Expert или Enterprise для Connection Builder)
+- Apphud SDK установлен в iOS-приложение
 
 ---
 
@@ -103,64 +138,62 @@ Treck_binom/
 ### Шаг 1: Скачиваем проект
 
 ```bash
-# Клонируем репозиторий (скачиваем код из GitHub)
 git clone https://github.com/your-username/Treck_binom.git
-
-# Заходим в папку проекта
 cd Treck_binom
 ```
 
 ### Шаг 2: Настраиваем сервер
 
 ```bash
-# Заходим в папку сервера
 cd server
-
-# Копируем файл с примером настроек
 cp .env.example .env
 ```
 
-Теперь открой файл `server/.env` в любом текстовом редакторе и заполни:
+Открой `server/.env` и заполни:
 
 ```env
-# URL твоего Binom трекера (без / в конце)
-# Например: https://tracker.mysite.com
+# === BINOM ===
+# URL трекера (без / в конце). Пример: https://tracker.mysite.com
 BINOM_URL=https://your-binom-domain.com
 
-# API-ключ Binom (найдёшь в настройках Binom)
+# API-ключ (Binom → Settings → API)
 BINOM_API_KEY=your_api_key_here
 
-# Порт, на котором будет работать сервер
+# === СЕРВЕР ===
 PORT=3000
 
-# Публичный URL твоего сервера (тот, что видят пользователи)
-# Например: https://track.mysite.com
+# Публичный URL сервера (который видят пользователи)
 BASE_URL=https://your-server-domain.com
 
-# ID кампании в Binom (число)
+# === КАМПАНИЯ ===
+# ID кампании в Binom (число из таблицы Campaigns)
 CAMPAIGN_ID=1
+LANDING_ID=1
+
+# === APPHUD (если используешь покупки) ===
+# Секретный токен для проверки вебхуков
+# Придумай любую строку и укажи её же в Apphud Dashboard
+APPHUD_SECRET_TOKEN=my-super-secret-token-123
 ```
 
-**Где взять API-ключ Binom?**
-1. Зайди в Binom → Settings → API
-2. Скопируй ключ
+**Где это всё взять?**
 
-**Где взять Campaign ID?**
-1. Зайди в Binom → Campaigns
-2. Создай новую кампанию (или возьми существующую)
-3. ID — это число в первом столбце таблицы
+| Настройка | Где найти |
+|-----------|-----------|
+| `BINOM_URL` | Адрес, по которому ты заходишь в Binom |
+| `BINOM_API_KEY` | Binom → Settings → API → скопировать ключ |
+| `CAMPAIGN_ID` | Binom → Campaigns → число в первом столбце |
+| `BASE_URL` | Домен твоего сервера (где развёрнут этот проект) |
+| `APPHUD_SECRET_TOKEN` | Придумай сам (любая строка, чем длиннее — тем безопаснее) |
 
-Теперь устанавливаем зависимости и запускаем:
+Устанавливаем зависимости и запускаем:
 
 ```bash
-# Устанавливаем библиотеки (Express, SQLite и др.)
 npm install
-
-# Запускаем сервер
 npm start
 ```
 
-Если всё ок, увидишь:
+Увидишь:
 ```
 Treck Binom server running on port 3000
 Landing page: https://your-server-domain.com/landing/index.html
@@ -169,214 +202,389 @@ Click URL: https://your-server-domain.com/click
 
 ### Шаг 3: Настраиваем лендинг
 
-Открой файл `landing/tracker.js` и найди блок `CONFIG` в начале файла:
+Открой `landing/tracker.js`, найди `CONFIG` в начале:
 
 ```javascript
 var CONFIG = {
     // Оставь пустым, если лендинг и сервер на одном домене
     serverUrl: '',
 
-    // Замени на ссылку СВОЕГО приложения в App Store
+    // Ссылка на СВОЁ приложение в App Store
     appStoreUrl: 'https://apps.apple.com/app/id000000000',
 
-    // URL-схема твоего приложения (если есть)
-    // Если не знаешь что это — оставь пустым: ''
+    // URL-схема приложения (если есть). Не знаешь — оставь ''
     appScheme: 'yourapp://',
 };
 ```
 
-**Как найти ссылку на App Store?**
-1. Открой https://apps.apple.com
-2. Найди своё приложение
-3. Скопируй ссылку из адресной строки
+**Как найти ссылку App Store?** Открой apps.apple.com → найди своё приложение → скопируй URL.
 
-**Что такое URL-схема?**
-Это когда приложение открывается по специальной ссылке типа `telegram://` или `instagram://`. Если у тебя это настроено в приложении — укажи. Если нет — оставь пустой строкой.
+**Что такое URL-схема?** Когда приложение открывается по ссылке типа `telegram://` или `instagram://`. Не знаешь — оставь пустым.
 
 ### Шаг 4: Встраиваем SDK в iOS-приложение
 
-#### 4.1 Добавляем библиотеку в Xcode
+#### 4.1 Добавляем пакет в Xcode
 
-1. Открой свой проект в Xcode
-2. Меню: **File** → **Add Package Dependencies...**
-3. В поле URL вставь ссылку на этот репозиторий
-4. Нажми **Add Package**
-5. Убедись что `BinomTracker` отмечен галочкой → **Add Package**
+1. Xcode → **File** → **Add Package Dependencies...**
+2. Вставь URL репозитория
+3. Нажми **Add Package**
+4. Отметь `BinomTracker` галочкой → **Add Package**
 
-#### 4.2 Добавляем код в приложение
-
-Открой файл `AppDelegate.swift` (или где у тебя стартует приложение) и добавь:
+#### 4.2 Минимальный код (без Apphud)
 
 ```swift
-// В самом верху файла, рядом с другими import
 import BinomTracker
-
-// Внутри функции application(_:didFinishLaunchingWithOptions:)
-// ЭТО ФУНКЦИЯ, КОТОРАЯ ВЫЗЫВАЕТСЯ ПРИ ЗАПУСКЕ ПРИЛОЖЕНИЯ
 
 func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
 ) -> Bool {
 
-    // --- Наш код начинается тут ---
-
-    // 1. Указываем адрес нашего сервера
+    // 1. Настраиваем (замени URL на свой!)
     BinomTracker.shared.configure(
-        serverURL: "https://your-server-domain.com",  // ← ЗАМЕНИ на свой URL
-        debug: true  // true = показывать логи в консоли Xcode (для отладки)
+        serverURL: "https://your-server-domain.com",
+        debug: true  // false в продакшене
     )
 
-    // 2. Трекаем установку (сработает только 1 раз — при первом запуске)
-    BinomTracker.shared.trackInstall { success in
-        if success {
-            print("Установка успешно отслежена!")
-        } else {
-            print("Не удалось отследить установку")
-        }
+    // 2. Трекаем установку
+    BinomTracker.shared.trackInstall { status in
+        guard let status = status else { return }
+        print("Статус: \(status.status)")  // "organic" или "non-organic"
     }
-
-    // --- Наш код заканчивается тут ---
 
     return true
 }
 ```
 
-#### 4.3 Трекаем события внутри приложения (опционально)
-
-Если хочешь отслеживать действия пользователей (регистрация, покупки и т.д.):
+#### 4.3 Полный код (с Apphud + воронки)
 
 ```swift
-// Когда пользователь зарегистрировался:
+import BinomTracker
+import ApphudSDK
+
+func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+) -> Bool {
+
+    // 1. СНАЧАЛА Apphud (до BinomTracker!)
+    Apphud.start(apiKey: "your_apphud_api_key")
+
+    // 2. Потом BinomTracker
+    BinomTracker.shared.configure(
+        serverURL: "https://your-server-domain.com",
+        debug: true
+    )
+
+    // 3. Трекаем установку
+    //    BinomTracker АВТОМАТИЧЕСКИ прокинет данные в Apphud:
+    //    - binom_click_id (для постбеков покупок)
+    //    - attribution_status (organic / non-organic)
+    //    - campaign_source, campaign_id и т.д.
+    BinomTracker.shared.trackInstall { status in
+        guard let status = status else { return }
+
+        if status.isNonOrganic {
+            print("Пришёл с рекламы! Источник: \(status.campaignData["source"] ?? "")")
+        }
+    }
+
+    return true
+}
+```
+
+#### 4.4 Воронки: показываем разный контент
+
+```swift
+// Где-нибудь на экране онбординга или пейволла:
+
+BinomTracker.shared.checkStatus { status in
+    DispatchQueue.main.async {
+        if status.isNonOrganic {
+            // Пользователь пришёл с рекламы →
+            // показываем агрессивный пейволл / специальную воронку
+            self.showAdFunnel()
+        } else {
+            // Organic пользователь →
+            // стандартный онбординг
+            self.showStandardOnboarding()
+        }
+    }
+}
+```
+
+**Важно:** `checkStatus()` работает быстро — первый вызов идёт на сервер, все последующие берут результат из кэша (UserDefaults). Можно вызывать сколько угодно раз.
+
+#### 4.5 Трекинг событий (опционально)
+
+```swift
+// Регистрация
 BinomTracker.shared.trackEvent(name: "registration")
 
-// Когда пользователь совершил покупку:
-BinomTracker.shared.trackEvent(
-    name: "purchase",
-    value: "premium_monthly",  // Что именно купил
-    payout: 9.99               // Сколько заплатил (в долларах)
-)
+// Покупка (в дополнение к Apphud)
+BinomTracker.shared.trackEvent(name: "purchase", value: "premium", payout: 9.99)
 
-// Любое другое событие:
-BinomTracker.shared.trackEvent(name: "tutorial_complete")
+// Любое событие
+BinomTracker.shared.trackEvent(name: "level_complete", value: "5")
 ```
 
 ---
 
-## Настройка Binom
+## Настройка Apphud Connection Builder (для покупок)
 
-### Создание кампании
+Это нужно, чтобы **покупки из Apphud** приходили в **Binom** с revenue.
 
-1. Зайди в **Binom** → **Campaigns** → **Create**
-2. Заполни:
-   - **Name**: любое понятное имя (например, "iOS App - Facebook")
-   - **Traffic Source**: выбери источник трафика
-   - **Offer**: выбери или создай оффер
-3. **Запомни Campaign ID** (число) — его вписываешь в `.env` файл
+### Зачем?
 
-### Настройка Postback URL (для партнёрской сети)
-
-Если ты работаешь с партнёрской сетью (CPA-сеть), им нужно дать URL для постбеков:
-
+Без этого Binom видит только установки. С этим — видит полную картину:
 ```
-https://your-binom-domain.com/click.php?cnv_id=CAMPAIGN_ID&cnv_status=install&clickid={clickid}
+Клик → Установка → Покупка $9.99 (proceeds $6.99) → ROI = 249%
 ```
 
-Замени:
-- `your-binom-domain.com` — на домен твоего Binom
-- `CAMPAIGN_ID` — на ID кампании (число)
+### Как настроить (пошагово)
+
+#### 1. Откройте Apphud Dashboard
+
+**Connections** → **Integrations** → **Connection Builder** → **Add Connection**
+
+#### 2. Заполните основные поля
+
+| Поле | Значение |
+|------|----------|
+| **Source** | iOS |
+| **Name** | Binom Postback |
+| **URL** | `https://your-server.com/apphud/webhook` |
+| **Header Name** | `X-Apphud-Token` |
+| **Header Value** | тот же токен что в `APPHUD_SECRET_TOKEN` |
+
+#### 3. Выберите события
+
+Включите галочками:
+
+| Событие | Что значит |
+|---------|-----------|
+| `trial_started` | Пользователь начал пробный период |
+| `trial_converted` | Оплатил после триала |
+| `subscription_started` | Купил подписку |
+| `subscription_renewed` | Подписка автоматически продлилась |
+| `non_renewing_purchase` | Разовая покупка |
+| `subscription_refunded` | Запросил возврат |
+| `subscription_canceled` | Отменил автопродление |
+
+#### 4. Вставьте JSON-шаблон в Body
+
+Скопируйте этот JSON целиком:
+
+```json
+{
+  "event_id": "{{ event.id }}",
+  "event_name": "{{ event.name }}",
+  "product_id": "{{ event.receipt.product_id }}",
+  "price_usd": {{ event.receipt.price_usd | default: 0 }},
+  "proceeds_usd": {{ event.receipt.proceeds_usd | default: 0 }},
+  "currency": "{{ event.receipt.currency | default: 'USD' }}",
+  "transaction_id": "{{ event.receipt.transaction_id }}",
+  "original_transaction_id": "{{ event.receipt.original_transaction_id }}",
+  "user_id": "{{ user.user_id }}",
+  "binom_click_id": "{{ user.user_properties.binom_click_id }}",
+  "treck_click_id": "{{ user.user_properties.treck_click_id }}",
+  "attribution_status": "{{ user.user_properties.attribution_status }}",
+  "campaign_source": "{{ user.user_properties.campaign_source }}",
+  "campaign_id": "{{ user.user_properties.campaign_id }}",
+  "creative_id": "{{ user.user_properties.creative_id }}"
+}
+```
+
+**Что это за `{{ ... }}`?** Это шаблоны Liquid — Apphud подставит сюда реальные данные. Например, `{{ event.receipt.price_usd }}` заменится на `9.99`.
+
+**Откуда берётся `{{ user.user_properties.binom_click_id }}`?** Наш BinomTracker SDK автоматически записал это свойство в Apphud при trackInstall(). Apphud его запомнил и теперь подставляет в шаблон.
+
+#### 5. Протестируйте
+
+В Connection Builder нажмите иконку 👁️ → введите Transaction ID тестовой покупки → Apphud отправит тестовый запрос на ваш сервер.
+
+#### 6. Ручной тест (curl)
+
+```bash
+curl -X POST https://your-server.com/apphud/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-Apphud-Token: my-super-secret-token-123" \
+  -d '{
+    "event_name": "subscription_started",
+    "product_id": "com.app.premium_monthly",
+    "price_usd": 9.99,
+    "proceeds_usd": 6.99,
+    "currency": "USD",
+    "transaction_id": "test-txn-001",
+    "user_id": "user-123",
+    "binom_click_id": "abc123",
+    "treck_click_id": "550e8400-e29b-41d4-a716-446655440000",
+    "attribution_status": "non-organic"
+  }'
+```
+
+Ожидаемый ответ:
+```json
+{
+  "status": "ok",
+  "event_name": "subscription_started",
+  "postback_sent": true,
+  "binom_click_id": "abc123"
+}
+```
 
 ---
 
-## API-эндпоинты (что умеет сервер)
+## Как работает матчинг? (сопоставление клика и установки)
 
-Это URL-адреса, на которые можно отправлять запросы. Сервер их обрабатывает.
+Когда приходит установка, сервер пробует найти клик **6 способами** — от самого точного к наименее точному. Как только находит — останавливается.
+
+| # | Метод | Точность | Как работает |
+|---|-------|----------|-------------|
+| 1 | `click_id` | ~99% | Лендинг скопировал click_id в буфер обмена → приложение прочитало |
+| 2 | `client_hash` | ~95% | Лендинг и приложение сгенерировали одинаковый хэш устройства |
+| 3 | IP + экран + язык + TZ + iOS | ~90% | Все параметры совпали |
+| 4 | IP + экран + язык + TZ | ~80% | Почти все параметры совпали |
+| 5 | IP + экран | ~65% | Совпали IP и размер экрана |
+| 6 | Только IP | ~35% | Последний шанс, самый неточный |
+
+### Что входит в хэш устройства?
+
+Хэш — это SHA-256 от строки вида:
+
+```
+"1179|2556|ru|Europe/Moscow|17.2|3"
+  │     │   │       │         │   │
+  │     │   │       │         │   └── Device Pixel Ratio (2 или 3)
+  │     │   │       │         └── Версия iOS (major.minor, без patch)
+  │     │   │       └── Часовой пояс
+  │     │   └── Язык (2 буквы)
+  │     └── Высота экрана в пикселях
+  └── Ширина экрана в пикселях
+```
+
+**Почему без patch-версии?** Между кликом и установкой может пройти время, и iOS может обновиться с 17.2.0 до 17.2.1. Major.minor (17.2) не изменится, а patch — может.
+
+Хэш генерируется **одинаково** на лендинге (JavaScript) и в приложении (Swift). Если совпал — это одно и то же устройство.
+
+---
+
+## API-эндпоинты сервера
 
 ### GET `/click` — Регистрация клика
 
-Сюда перенаправляется пользователь с рекламы. Это самый первый шаг.
+Сюда перенаправляется пользователь с рекламы.
 
-**Пример ссылки для рекламы:**
+**Ссылка для рекламы:**
 ```
-https://your-server.com/click?sub1=facebook&sub2=campaign_123
+https://your-server.com/click?sub1=facebook&sub2=campaign_123&source=fb
 ```
 
-**Что делает:**
-1. Запоминает IP, браузер, устройство
-2. Генерирует уникальный click_id
-3. Регистрирует клик в Binom
-4. Перенаправляет на лендинг
-
-**Параметры (необязательные):**
-- `sub1` ... `sub15` — дополнительные метки (источник, кампания и т.д.)
-- `clickid` — внешний click_id от рекламной сети
+**Параметры (все необязательные):**
+- `sub1` ... `sub15` — метки для аналитики
+- `clickid` — click_id от рекламной сети
 - `source` — название источника
-- `ref` — реферер
+- `campaign_id` — ID кампании
+- `creative_id` — ID креатива
+- `adset_id` — ID группы объявлений
+- `ad_id` — ID объявления
+- `placement` — площадка
+
+**Что делает:** сохраняет клик → регистрирует в Binom → перенаправляет на лендинг.
 
 ---
 
-### POST `/click/fingerprint` — Обновление фингерпринта
+### POST `/click/fingerprint` — Фингерпринт с лендинга
 
-Вызывается автоматически скриптом лендинга. Не нужно вызывать вручную.
-
-**Тело запроса (JSON):**
-```json
-{
-    "click_id": "abc-123-def",
-    "screenWidth": 1170,
-    "screenHeight": 2532,
-    "language": "ru",
-    "timezone": "Europe/Moscow"
-}
-```
+Вызывается **автоматически** скриптом `tracker.js`. Не нужно вызывать вручную.
 
 ---
 
 ### POST `/install` — Регистрация установки
 
-Вызывается iOS SDK при первом запуске приложения.
-
-**Тело запроса (JSON):**
-```json
-{
-    "click_id": "abc-123-def",
-    "device_id": "uuid-устройства",
-    "idfv": "идентификатор-вендора",
-    "bundle_id": "com.example.app",
-    "app_version": "1.0.0",
-    "os_version": "17.2",
-    "device_model": "iPhone15,2",
-    "screen_width": "1170",
-    "screen_height": "2532",
-    "language": "ru",
-    "timezone": "Europe/Moscow"
-}
-```
+Вызывается **автоматически** iOS SDK при первом запуске.
 
 **Ответ:**
 ```json
 {
-    "status": "ok",
-    "matched": true,
-    "match_method": "click_id",
-    "postback_sent": true
+  "status": "ok",
+  "attribution_status": "non-organic",
+  "matched": true,
+  "match_method": "client_hash",
+  "postback_sent": true,
+  "click_id": "550e8400-...",
+  "binom_click_id": "abc123xyz",
+  "campaign_data": {
+    "source": "facebook",
+    "campaign_id": "123",
+    "sub1": "fb_ios"
+  }
 }
 ```
 
 ---
 
-### POST `/event` — Трекинг событий
+### POST `/status` — Проверка: Organic или Non-Organic?
 
-Для отслеживания действий внутри приложения.
+Приложение может в любой момент спросить: "Этот пользователь пришёл с рекламы?"
 
-**Тело запроса (JSON):**
+**Ответ:**
 ```json
 {
-    "device_id": "uuid-устройства",
-    "idfv": "идентификатор-вендора",
-    "event_name": "purchase",
-    "event_value": "premium_monthly",
-    "payout": 9.99
+  "status": "non-organic",
+  "match_method": "client_hash",
+  "click_id": "550e8400-...",
+  "binom_click_id": "abc123xyz",
+  "campaign_data": {
+    "source": "facebook"
+  }
+}
+```
+
+Или для organic пользователя:
+```json
+{
+  "status": "organic",
+  "match_method": "none",
+  "click_id": null,
+  "binom_click_id": null,
+  "campaign_data": {}
+}
+```
+
+---
+
+### POST `/apphud/webhook` — Приём покупок из Apphud
+
+Apphud Connection Builder отправляет сюда данные о покупках. **Не вызывайте вручную** — это делает Apphud автоматически.
+
+**Маппинг событий Apphud → Binom:**
+
+| Событие Apphud | Статус в Binom | Payout |
+|----------------|---------------|--------|
+| `trial_started` | `trial` | $0 |
+| `trial_converted` | `purchase` | proceeds_usd |
+| `subscription_started` | `purchase` | proceeds_usd |
+| `subscription_renewed` | `rebill` | proceeds_usd |
+| `non_renewing_purchase` | `purchase` | proceeds_usd |
+| `subscription_refunded` | `refund` | proceeds_usd |
+| `subscription_canceled` | `cancel` | $0 |
+
+**proceeds_usd** — это то, что вы получаете после комиссии Apple (обычно 70-85% от цены).
+
+---
+
+### POST `/event` — Трекинг in-app событий
+
+Для отслеживания действий внутри приложения (регистрация, уровни и т.д.).
+
+```json
+{
+  "device_id": "uuid-устройства",
+  "idfv": "идентификатор-вендора",
+  "event_name": "purchase",
+  "event_value": "premium_monthly",
+  "payout": 9.99
 }
 ```
 
@@ -386,104 +594,113 @@ https://your-server.com/click?sub1=facebook&sub2=campaign_123
 
 Открой в браузере: `https://your-server.com/stats`
 
-**Ответ:**
 ```json
 {
-    "date": "2026-03-04",
-    "clicks": 150,
-    "installs": 45,
-    "matched": 38,
-    "postbacks_sent": 38,
-    "match_rate": "84.4%"
+  "date": "2026-03-05",
+  "clicks": 150,
+  "installs": 45,
+  "organic": 12,
+  "non_organic": 33,
+  "matched": 33,
+  "postbacks_sent": 33,
+  "match_rate": "73.3%",
+  "match_methods": {
+    "click_id": 15,
+    "client_hash": 12,
+    "ip_screen_lang_tz_os": 4,
+    "ip_screen_lang_tz": 2
+  },
+  "apphud": {
+    "events": 8,
+    "revenue_usd": 49.93,
+    "postbacks_sent": 6,
+    "by_event": {
+      "subscription_started": { "count": 5, "revenue": 34.95 },
+      "trial_started": { "count": 3, "revenue": 0 }
+    }
+  }
 }
 ```
 
 ---
 
-### GET `/health` — Проверка работоспособности
+### GET `/health` — Жив ли сервер?
 
-Открой: `https://your-server.com/health` — если сервер работает, увидишь:
 ```json
-{
-    "status": "ok",
-    "timestamp": "2026-03-04T12:00:00.000Z"
-}
+{ "status": "ok", "timestamp": "2026-03-05T12:00:00.000Z" }
 ```
 
 ---
 
-## Как сервер понимает, что клик и установка — один человек?
+## Запуск через Docker
 
-Это называется **матчинг** (сопоставление). Используется 3 метода:
-
-### Метод 1: click_id (точность ~99%)
-Самый точный. Лендинг копирует click_id в буфер обмена телефона. Когда приложение запускается, SDK читает буфер обмена и находит click_id. Сервер сразу знает, какой клик привёл к установке.
-
-### Метод 2: Расширенный фингерпринт (точность ~85-90%)
-Если click_id не удалось передать, сервер сравнивает "отпечатки" устройств:
-- IP-адрес
-- Версия iOS
-- Модель устройства
-- Разрешение экрана
-- Язык
-- Часовой пояс
-
-Если все данные совпадают — это скорее всего тот же человек.
-
-### Метод 3: Серверный фингерпринт (точность ~70-80%)
-Последний шанс. Сравниваются только:
-- IP-адрес
-- Версия iOS
-- Модель устройства
-
-Менее точный, но работает как запасной вариант.
-
----
-
-## Запуск через Docker (альтернативный способ)
-
-Если не хочешь устанавливать Node.js, можно запустить через Docker:
+Если не хочешь ставить Node.js:
 
 ```bash
-# Создай файл .env в корне проекта с настройками
-# (такие же переменные, как в server/.env)
-
-# Запуск одной командой:
+# Создай .env в корне проекта (такие же переменные)
 docker-compose up -d
 
-# Посмотреть логи:
+# Логи
 docker-compose logs -f
 
-# Остановить:
+# Остановить
 docker-compose down
 ```
 
 ---
 
-## Частые проблемы и решения
+## Настройка Binom
 
-### Сервер не запускается
+### Создание кампании
+
+1. **Binom** → **Campaigns** → **Create**
+2. Заполни Name, Traffic Source, Offer
+3. **Запомни Campaign ID** → вписываешь в `.env`
+
+### Постбек для CPA-сети
+
+Если работаешь через партнёрку:
 ```
-Error: Cannot find module 'express'
+https://your-binom-domain.com/click.php?cnv_id=CAMPAIGN_ID&cnv_status=install&clickid={clickid}
 ```
-**Решение:** Ты забыл установить зависимости. Выполни `npm install` в папке `server/`.
 
-### Установки не матчатся (match_rate = 0%)
-**Возможные причины:**
-1. На лендинге неправильный `serverUrl` в `tracker.js`
-2. iOS SDK указывает на неправильный сервер
-3. Пользователь запускает приложение с другого IP (например, переключился с Wi-Fi на мобильный)
+---
 
-### Постбеки не приходят в Binom
-**Проверь:**
-1. Правильный ли `BINOM_URL` в `.env`?
-2. Правильный ли `CAMPAIGN_ID`?
-3. Работает ли Binom? Открой его URL в браузере
+## Полная схема системы
 
-### iOS SDK не работает
-**Проверь в консоли Xcode** (если `debug: true`):
-- `[BinomTracker] Install already tracked` — уже отслежено (удали приложение для теста)
-- `[BinomTracker] Request error: ...` — проблема с сетью, проверь URL сервера
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│  Реклама    │────▶│  Наш сервер  │────▶│   Binom     │
+│  (FB, TT)   │     │  /click      │     │  click.php  │
+└─────────────┘     └──────┬───────┘     └─────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │   Лендинг    │
+                    │  tracker.js  │
+                    │  (хэш + ID)  │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │  App Store   │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐     ┌──────────────┐     ┌─────────────┐
+                    │ iOS-прилож.  │────▶│  Наш сервер  │────▶│   Binom     │
+                    │ BinomTracker │     │  /install     │     │  postback   │
+                    │ + ApphudSDK  │     │  /status      │     │  (install)  │
+                    └──────┬───────┘     └──────────────┘     └─────────────┘
+                           │
+                    ┌──────▼───────┐     ┌──────────────┐     ┌─────────────┐
+                    │   Покупка    │────▶│   Apphud     │     │             │
+                    │  подписки    │     │  обработка   │     │             │
+                    └──────────────┘     └──────┬───────┘     │             │
+                                               │              │             │
+                                        ┌──────▼───────┐     │   Binom     │
+                                        │  Connection  │────▶│  postback   │
+                                        │  Builder     │     │  (purchase  │
+                                        │  POST webhook│     │   + $$$)    │
+                                        └──────────────┘     └─────────────┘
+```
 
 ---
 
@@ -491,22 +708,59 @@ Error: Cannot find module 'express'
 
 ### Проверить сервер:
 ```bash
-# Проверить что сервер работает
+# Работает ли?
 curl http://localhost:3000/health
 
 # Симулировать клик
-curl http://localhost:3000/click
+curl -L http://localhost:3000/click?sub1=test
 
-# Посмотреть статистику
+# Статистика
 curl http://localhost:3000/stats
 ```
 
 ### Проверить полный флоу:
 1. Открой в Safari на iPhone: `https://your-server.com/click?sub1=test`
 2. Ты попадёшь на лендинг
-3. Нажми "Download" (в App Store пока не переходи, если приложение ещё не опубликовано)
+3. Нажми "Download"
 4. Запусти приложение с SDK на этом же iPhone
-5. Проверь `https://your-server.com/stats` — должен появиться матч
+5. Проверь `https://your-server.com/stats`
+
+### Тест Apphud:
+1. Сделай тестовую покупку в sandbox
+2. Проверь Connection Builder логи в Apphud Dashboard
+3. Проверь `https://your-server.com/stats` → раздел `apphud`
+
+---
+
+## Частые проблемы
+
+### Сервер не запускается
+```
+Error: Cannot find module 'express'
+```
+Забыл `npm install` в папке `server/`.
+
+### Установки не матчатся (match_rate = 0%)
+- Неправильный `serverUrl` в `tracker.js`
+- iOS SDK указывает на неправильный сервер
+- Пользователь переключился с Wi-Fi на мобильный (другой IP)
+
+### Постбеки не приходят в Binom
+- Проверь `BINOM_URL` и `CAMPAIGN_ID` в `.env`
+- Открой URL Binom в браузере — работает ли он?
+
+### Apphud вебхуки не приходят
+- Проверь URL в Connection Builder: `https://your-server.com/apphud/webhook`
+- Проверь токен: `X-Apphud-Token` должен совпадать с `APPHUD_SECRET_TOKEN`
+- Включены ли нужные события в Connection Builder?
+- Apphud не шлёт sandbox-события по умолчанию
+
+### iOS SDK: "Apphud SDK not found"
+Это **нормально**, если Apphud не используется. BinomTracker проверяет наличие Apphud через runtime — если не найден, просто пропускает синхронизацию.
+
+### Покупки не связываются с кликами
+- Убедись что `Apphud.start()` вызывается **ДО** `BinomTracker.trackInstall()`
+- Проверь в Apphud Dashboard → Users → конкретный юзер → User Properties: есть ли `binom_click_id`?
 
 ---
 
@@ -515,13 +769,19 @@ curl http://localhost:3000/stats
 | Термин | Что значит |
 |--------|-----------|
 | **Клик (Click)** | Пользователь нажал на рекламу |
-| **Установка (Install)** | Пользователь скачал и открыл приложение |
-| **Матчинг (Matching)** | Сопоставление клика с установкой ("это один и тот же человек") |
-| **Постбек (Postback)** | Уведомление трекеру: "получена установка от клика X" |
-| **Фингерпринт (Fingerprint)** | "Отпечаток" устройства — набор характеристик для идентификации |
-| **Binom** | Трекер — программа для учёта рекламного трафика |
-| **SDK** | Software Development Kit — библиотека для встраивания в приложение |
+| **Установка (Install)** | Скачал и открыл приложение |
+| **Матчинг (Matching)** | Сопоставление: "клик и установка — один человек" |
+| **Постбек (Postback)** | Уведомление трекеру: "получена установка / покупка" |
+| **Хэш (Hash)** | "Отпечаток" устройства — уникальная строка из параметров экрана, языка и т.д. |
+| **Organic** | Пользователь сам нашёл приложение (не через рекламу) |
+| **Non-Organic** | Пришёл с рекламы |
+| **Binom** | Трекер рекламного трафика |
+| **Apphud** | Сервис обработки подписок и покупок |
+| **Connection Builder** | Инструмент Apphud для отправки событий на внешние серверы |
+| **SDK** | Библиотека для встраивания в приложение |
 | **Лендинг (Landing)** | Промежуточная страница между рекламой и App Store |
-| **API** | Набор URL-адресов, через которые программы общаются друг с другом |
-| **Deep Link** | Ссылка, которая открывает конкретный экран внутри приложения |
-| **IDFA / IDFV** | Идентификаторы устройства Apple для рекламы / для разработчика |
+| **ROI** | Return on Investment — окупаемость рекламы (потратил $2, заработал $7 = ROI 250%) |
+| **Revenue / Proceeds** | Доход. Price = цена для юзера, Proceeds = после комиссии Apple |
+| **IDFV** | Identifier for Vendor — идентификатор устройства для разработчика |
+| **Deep Link** | Ссылка, открывающая конкретный экран приложения |
+| **Webhook** | Автоматический HTTP-запрос при событии (покупка → POST на сервер) |
